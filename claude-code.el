@@ -1950,6 +1950,55 @@ enter Claude commands."
        (claude-code-read-only-mode)
      (claude-code-exit-read-only-mode))))
 
+;;;; Menu bar definition
+(defun claude-code--menu-switch-to-buffer (buffer)
+  "Switch to Claude BUFFER."
+  (pop-to-buffer buffer))
+
+(defun claude-code--contexts-menu-items ()
+  "Generate menu items for all active Claude contexts."
+  (let ((buffers (claude-code--find-all-claude-buffers)))
+    (if buffers
+        (mapcar (lambda (buf)
+                  (vector (claude-code--buffer-display-name buf)
+                          `(lambda () (interactive)
+                             (claude-code--menu-switch-to-buffer ,buf))
+                          :help (format "Switch to %s" (buffer-name buf))))
+                buffers)
+      '(["No active contexts" nil :enable nil]))))
+
+(defun claude-code-paste-image ()
+  "Paste image from clipboard to Claude by saving to temp file and sending path.
+
+On Linux, uses xclip to extract PNG image from clipboard.
+The image is saved to a temporary file and sent to Claude using the @ syntax."
+  (interactive)
+  (let* ((timestamp (format-time-string "%Y%m%d-%H%M%S"))
+         (temp-file (expand-file-name (format "claude-paste-%s.png" timestamp)
+                                      temporary-file-directory)))
+    ;; Check if clipboard has image
+    (if (= 0 (call-process-shell-command
+              "xclip -selection clipboard -t TARGETS -o 2>/dev/null | grep -q image/png"))
+        (progn
+          ;; Save clipboard image to temp file
+          (call-process-shell-command
+           (format "xclip -selection clipboard -t image/png -o > %s" temp-file))
+          (message "Pasted image: %s" temp-file)
+          (claude-code--do-send-command (format "@%s" temp-file)))
+      (message "No image in clipboard"))))
+
+(define-key claude-code-command-map (kbd "V") 'claude-code-paste-image)
+
+(easy-menu-define claude-code-menu global-map "Claude Code menu."
+  '("Claude"
+    ["Paste Image (C-c c V)" claude-code-paste-image
+     :help "Paste image from clipboard to Claude"]
+    ["Toggle Read Only (C-c c z)" claude-code-toggle-read-only-mode
+     :help "Toggle read-only mode for scrolling and selecting text"]
+    "---"
+    ("Switch Context"
+     :filter (lambda (_) (claude-code--contexts-menu-items)))))
+
 ;;;; Mode definition
 ;;;###autoload
 (define-minor-mode claude-code-mode
