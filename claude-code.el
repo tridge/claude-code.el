@@ -1984,7 +1984,14 @@ The image is saved to a temporary file and sent to Claude using the @ syntax."
           (call-process-shell-command
            (format "xclip -selection clipboard -t image/png -o > %s" temp-file))
           (message "Pasted image: %s" temp-file)
-          (claude-code--do-send-command (format "@%s" temp-file)))
+          ;; Send image path with trailing space (no newline) so user can
+          ;; paste more images or add a comment before pressing return
+          (if-let ((claude-code-buffer (claude-code--get-or-prompt-for-buffer)))
+              (with-current-buffer claude-code-buffer
+                (claude-code--term-send-string
+                 claude-code-terminal-backend (format "@%s " temp-file))
+                (display-buffer claude-code-buffer))
+            (claude-code--show-not-running-message)))
       (message "No image in clipboard"))))
 
 (define-key claude-code-command-map (kbd "V") 'claude-code-paste-image)
