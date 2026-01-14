@@ -390,6 +390,7 @@ this history by adding `claude-code-command-history' to
     (define-key map (kbd "x") 'claude-code-send-command-with-context)
     (define-key map (kbd "y") 'claude-code-send-return)
     (define-key map (kbd "z") 'claude-code-toggle-read-only-mode)
+    (define-key map (kbd "l") 'claude-code-refresh-terminal)
     (define-key map (kbd "1") 'claude-code-send-1)
     (define-key map (kbd "2") 'claude-code-send-2)
     (define-key map (kbd "3") 'claude-code-send-3)
@@ -426,6 +427,7 @@ this history by adding `claude-code-command-history' to
     ("b" "Switch to Claude buffer" claude-code-switch-to-buffer)
     ("B" "Select from all Claude buffers" claude-code-select-buffer)
     ("z" "Toggle read-only mode" claude-code-toggle-read-only-mode)
+    ("l" "Refresh terminal" claude-code-refresh-terminal)
     ("M" "Cycle Claude mode" claude-code-cycle-mode :transient t)
     ]
    ["Quick Responses"
@@ -507,6 +509,9 @@ Returns the buffer containing the terminal.")
 
 (cl-defgeneric claude-code--term-get-adjust-process-window-size-fn (backend)
   "Get the BACKEND specific function that adjusts window size.")
+
+(cl-defgeneric claude-code--term-refresh (backend)
+  "Refresh the terminal display using BACKEND to fix corruption.")
 
 ;;;;; eat backend implementations
 
@@ -708,6 +713,16 @@ _BACKEND is the terminal backend type (should be \\='eat)."
   "Get the BACKEND specific function that adjusts window size."
   #'eat--adjust-process-window-size)
 
+(cl-defmethod claude-code--term-refresh ((_backend (eql eat)))
+  "Refresh eat terminal to fix display corruption.
+
+Sends Ctrl-L to request redraw and forces terminal size update."
+  (when (bound-and-true-p eat-terminal)
+    ;; Send Ctrl-L to request redraw from Claude
+    (eat-term-send-string eat-terminal "\C-l")
+    ;; Force terminal redisplay
+    (eat-term-redisplay eat-terminal)))
+
 ;;;;; vterm backend implementations
 
 ;; Declare external variables and functions from vterm package
@@ -908,6 +923,13 @@ _BACKEND is the terminal backend type (should be \\='vterm)."
 (cl-defmethod claude-code--term-get-adjust-process-window-size-fn ((_backend (eql vterm)))
   "Get the BACKEND specific function that adjusts window size."
   #'vterm--window-adjust-process-window-size)
+
+(cl-defmethod claude-code--term-refresh ((_backend (eql vterm)))
+  "Refresh vterm terminal to fix display corruption.
+
+Sends Ctrl-L to request redraw from Claude."
+  ;; Send Ctrl-L to request redraw
+  (vterm-send-key "\C-l"))
 
 ;;;; Private util functions
 (defmacro claude-code--with-buffer (&rest body)
@@ -1950,6 +1972,17 @@ enter Claude commands."
        (claude-code-read-only-mode)
      (claude-code-exit-read-only-mode))))
 
+;;;###autoload
+(defun claude-code-refresh-terminal ()
+  "Refresh the terminal display to fix corruption after window resize.
+
+Sends Ctrl-L to Claude to request a screen redraw. Use this when the
+terminal display becomes garbled after resizing the Emacs window."
+  (interactive)
+  (claude-code--with-buffer
+   (claude-code--term-refresh claude-code-terminal-backend)
+   (message "Terminal refresh requested")))
+
 ;;;; Menu bar definition
 (defun claude-code--menu-switch-to-buffer (buffer)
   "Switch to Claude BUFFER."
@@ -2002,6 +2035,8 @@ The image is saved to a temporary file and sent to Claude using the @ syntax."
      :help "Paste image from clipboard to Claude"]
     ["Toggle Read Only (C-c c z)" claude-code-toggle-read-only-mode
      :help "Toggle read-only mode for scrolling and selecting text"]
+    ["Refresh Terminal (C-c c l)" claude-code-refresh-terminal
+     :help "Fix terminal display corruption after window resize"]
     "---"
     ("Switch Context"
      :filter (lambda (_) (claude-code--contexts-menu-items)))))
