@@ -356,7 +356,7 @@ This allows remembering which Claude instance the user selected
 for each directory across multiple invocations.")
 
 (defvar claude-code--window-widths nil
-  "Hash table mapping windows to their last known widths for eat terminals.")
+  "Hash table mapping Claude buffers to their last known terminal widths.")
 
 (defvar claude-code-command-history nil
   "History of commands sent to Claude.
@@ -716,7 +716,19 @@ _BACKEND is the terminal backend type (should be \\='eat)."
 (cl-defmethod claude-code--term-refresh ((_backend (eql eat)))
   "Refresh eat terminal to fix display corruption.
 
-Sends Ctrl-L to request redraw and forces terminal size update."
+Clears cached width, forces the pty to the current window size,
+sends SIGWINCH and Ctrl-L to make Claude redraw."
+  ;; Clear cached width so the resize advice won't suppress the next update
+  (when claude-code--window-widths
+    (remhash (current-buffer) claude-code--window-widths))
+  (when-let ((proc (get-buffer-process (current-buffer)))
+             (win (get-buffer-window (current-buffer) t)))
+    ;; Update pty size to match current window dimensions
+    (let ((width (window-max-chars-per-line win))
+          (height (window-body-height win)))
+      (set-process-window-size proc height width))
+    ;; Send SIGWINCH so the process re-queries terminal size
+    (signal-process proc 'SIGWINCH))
   (when (bound-and-true-p eat-terminal)
     ;; Send Ctrl-L to request redraw from Claude
     (eat-term-send-string eat-terminal "\C-l")
@@ -927,7 +939,19 @@ _BACKEND is the terminal backend type (should be \\='vterm)."
 (cl-defmethod claude-code--term-refresh ((_backend (eql vterm)))
   "Refresh vterm terminal to fix display corruption.
 
-Sends Ctrl-L to request redraw from Claude."
+Clears cached width, forces the pty to the current window size,
+sends SIGWINCH and Ctrl-L to make Claude redraw."
+  ;; Clear cached width so the resize advice won't suppress the next update
+  (when claude-code--window-widths
+    (remhash (current-buffer) claude-code--window-widths))
+  (when-let ((proc (get-buffer-process (current-buffer)))
+             (win (get-buffer-window (current-buffer) t)))
+    ;; Update pty size to match current window dimensions
+    (let ((width (window-max-chars-per-line win))
+          (height (window-body-height win)))
+      (set-process-window-size proc height width))
+    ;; Send SIGWINCH so the process re-queries terminal size
+    (signal-process proc 'SIGWINCH))
   ;; Send Ctrl-L to request redraw
   (vterm-send-key "\C-l"))
 
@@ -1279,8 +1303,8 @@ With double prefix ARG (\\[universal-argument] \\[universal-argument]), prompt f
       ;; Configure terminal with backend-specific settings
       (claude-code--term-configure claude-code-terminal-backend)
 
-      ;; Initialize the window widths hash table
-      (setq claude-code--window-widths (make-hash-table :test 'eq :weakness 'key))
+      ;; Initialize the window widths hash table (keyed by buffer)
+      (setq claude-code--window-widths (make-hash-table :test 'eq))
 
       ;; Set up window width tracking if optimization is enabled
       (when claude-code-optimize-window-resize
@@ -1617,33 +1641,26 @@ INPUT is the terminal output string."
 Works with `eat--adjust-process-window-size' or
 `vterm--adjust-process-window-size' to prevent unnecessary reflows.
 
-Returns the size returned by ORIG-FUN only when the width of any Claude
-window has changed, not when only the height has changed. This prevents
-unnecessary terminal reflows when only vertical space changes.
+Returns the size returned by ORIG-FUN only when the width has changed,
+not when only the height has changed.  This prevents unnecessary terminal
+reflows when only vertical space changes.
 
 ARGS is passed to ORIG-FUN unchanged."
   (let ((result (apply orig-fun args)))
-    ;; Check all windows for Claude buffers
-    (let ((width-changed nil))
-      (dolist (window (window-list))
-        (let ((buffer (window-buffer window)))
-          (when (and buffer (claude-code--buffer-p buffer))
-            (let ((current-width (window-width window))
-                  (stored-width (gethash window claude-code--window-widths)))
-              ;; Check if this is a new window or if width changed
-              (when (or (not stored-width) (/= current-width stored-width))
-                (setq width-changed t)
-                ;; Update stored width
-                (puthash window current-width claude-code--window-widths))))))
-      ;; If current buffer is not a Claude buffer, just pass through normally
-      (if (not (claude-code--buffer-p (current-buffer)))
-          result
-        ;; For Claude buffers: Return result only if a Claude window width changed and
-        ;; we're not in read-only mode. otherwise nil. Nil means do
-        ;; not send a window size changed event to the Claude process.
-        (if (and width-changed (not (claude-code--term-in-read-only-p claude-code-terminal-backend)))
-            result
-          nil)))))
+    ;; If current buffer is not a Claude buffer, just pass through normally
+    (if (not (claude-code--buffer-p (current-buffer)))
+        result
+      ;; For Claude buffers: only signal when width actually changed.
+      ;; Compare the new width from result against stored width for this buffer.
+      (when result
+        (let* ((new-width (car result))
+               (stored-width (gethash (current-buffer) claude-code--window-widths)))
+          (if (or (not stored-width) (/= new-width stored-width))
+              (progn
+                (puthash (current-buffer) new-width claude-code--window-widths)
+                result)
+            ;; Width unchanged (height-only change), suppress resize signal
+            nil))))))
 
 ;;;; Interactive Commands
 ;;;###autoload
