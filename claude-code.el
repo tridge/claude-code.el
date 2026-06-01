@@ -45,6 +45,29 @@
   :type 'string
   :group 'claude-code)
 
+(defcustom claude-code-make-links-clickable t
+  "When non-nil, make URLs in Claude's terminal output clickable.
+
+URLs in the visible portion of the buffer are highlighted using
+`goto-address' overlays so they can be followed with a mouse click
+\(mouse-1 or mouse-2) or with \\[goto-address-at-point], without
+needing to switch to read-only mode and copy the URL by hand.
+
+This works with both the eat and vterm terminal backends."
+  :type 'boolean
+  :group 'claude-code)
+
+(defcustom claude-code-link-fontify-idle-delay 0.3
+  "Idle time in seconds before fontifying URLs in Claude output.
+
+After Claude produces output, URLs in the visible portion of the
+buffer are made clickable once Emacs has been idle for this long.
+A small delay avoids doing work while output is still streaming.
+
+Only used when `claude-code-make-links-clickable' is non-nil."
+  :type 'number
+  :group 'claude-code)
+
 (defcustom claude-code-start-hook nil
   "Hook run after Claude is started."
   :type 'hook
@@ -955,6 +978,70 @@ sends SIGWINCH and Ctrl-L to make Claude redraw."
   ;; Send Ctrl-L to request redraw
   (vterm-send-key "\C-l"))
 
+;;;; Clickable links
+
+(declare-function goto-address-fontify "goto-addr" (&optional start end))
+
+(defvar-local claude-code--link-fontify-timer nil
+  "Idle timer that fontifies URLs in this Claude buffer.")
+
+(defvar-local claude-code--link-fontify-state nil
+  "Last seen content/scroll state, used to skip redundant fontification.
+
+A cons of the buffer's `buffer-chars-modified-tick' and the list of
+window start positions when links were last fontified.")
+
+(defun claude-code--fontify-visible-links ()
+  "Make URLs clickable in the visible portion of the current Claude buffer.
+
+Fontifies the visible region of every window currently displaying the
+buffer, so only on-screen text is scanned.  Uses `goto-address'
+overlays, which work whether the buffer is in interactive or read-only
+mode."
+  (require 'goto-addr)
+  (dolist (window (get-buffer-window-list (current-buffer) nil t))
+    (let ((start (window-start window))
+          (end (window-end window t)))
+      (when (and start end (< start end))
+        (goto-address-fontify start end)))))
+
+(defun claude-code--maybe-fontify-links (buffer)
+  "Fontify links in BUFFER when its content or scroll position has changed.
+
+This is run from an idle timer.  It does nothing when BUFFER's text and
+all of its window start positions are unchanged since the last run, so
+that repeated idle firings are cheap."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (let ((state (cons (buffer-chars-modified-tick)
+                         (mapcar #'window-start
+                                 (get-buffer-window-list buffer nil t)))))
+        (unless (equal state claude-code--link-fontify-state)
+          (setq claude-code--link-fontify-state state)
+          (claude-code--fontify-visible-links))))))
+
+(defun claude-code--cancel-link-fontify-timer ()
+  "Cancel the link fontification idle timer for the current buffer."
+  (when claude-code--link-fontify-timer
+    (cancel-timer claude-code--link-fontify-timer)
+    (setq claude-code--link-fontify-timer nil)))
+
+(defun claude-code--setup-clickable-links ()
+  "Make URLs in the current Claude buffer clickable.
+
+Starts a buffer-local idle timer that highlights URLs in the visible
+portion of the buffer as Claude produces output, and arranges for the
+timer to be cancelled when the buffer is killed.  Does nothing when
+`claude-code-make-links-clickable' is nil."
+  (when claude-code-make-links-clickable
+    (require 'goto-addr)
+    (claude-code--cancel-link-fontify-timer)
+    (setq claude-code--link-fontify-timer
+          (run-with-idle-timer claude-code-link-fontify-idle-delay t
+                               #'claude-code--maybe-fontify-links
+                               (current-buffer)))
+    (add-hook 'kill-buffer-hook #'claude-code--cancel-link-fontify-timer nil t)))
+
 ;;;; Private util functions
 (defmacro claude-code--with-buffer (&rest body)
   "Execute BODY with the Claude buffer, handling buffer selection and display.
@@ -1328,6 +1415,9 @@ With double prefix ARG (\\[universal-argument] \\[universal-argument]), prompt f
 
       ;; Add cleanup hook to remove directory mappings when buffer is killed
       (add-hook 'kill-buffer-hook #'claude-code--cleanup-directory-mapping nil t)
+
+      ;; Make URLs in Claude's output clickable
+      (claude-code--setup-clickable-links)
 
       ;; run start hooks
       (run-hooks 'claude-code-start-hook)
