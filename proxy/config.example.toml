@@ -1,0 +1,41 @@
+# Example MCP proxy configuration.
+#
+# The proxy speaks MCP (stdio) to Claude and fans out to the upstream
+# servers listed below. Tools are re-exported to Claude as
+# "<upstream_name>__<tool_name>".
+
+[control]
+# HTTP control plane. Bind to loopback only on a multi-user machine.
+host = "127.0.0.1"
+port = 8765
+
+# [[upstream]]
+# name = "filesystem"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/you/work"]
+
+# Google Workspace upstream (taylorwilsdon/google_workspace_mcp).
+# Install: `uv tool install workspace-mcp` (or `pip install workspace-mcp`).
+# Set up an OAuth Desktop client in Google Cloud Console; supply the client
+# id (and optionally secret) via the env block.
+#
+# [[upstream]]
+# name = "workspace"
+# command = "uvx"
+# args = ["workspace-mcp", "--single-user", "--tools", "docs", "drive"]
+# env = { GOOGLE_OAUTH_CLIENT_ID = "...apps.googleusercontent.com" }
+#
+# [upstream.policy.gdrive_writes]
+# # Tools whose calls are subject to the writable-folder check.
+# write_tools = [
+#   "create_drive_file",
+#   "create_drive_folder",
+#   "import_to_google_doc",
+#   "copy_drive_file",
+#   "create_doc",  # blocked: takes no folder argument
+# ]
+# parent_keys = ["folder_id", "parent_folder_id"]
+# writable_folders = []
+# no_parent_action = "deny"
+# # Always-blocked tools (e.g. ACL changes).
+# block_tools = ["manage_drive_access", "set_drive_file_permissions"]

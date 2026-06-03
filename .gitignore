@@ -14,3 +14,11 @@
 
 # Experimental sockets/MCP directory
 sockets-mcp/
+
+# Python build artifacts (proxy/)
+__pycache__/
+*.py[co]
+*.egg-info/
+.venv/
+build/
+dist/

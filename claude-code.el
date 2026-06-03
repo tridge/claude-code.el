@@ -127,6 +127,26 @@ These are passed as SWITCHES parameters to `eat-make`."
   :type '(repeat string)
   :group 'claude-code)
 
+(defcustom claude-code-disable-mcp nil
+  "When non-nil, start Claude with all MCP servers disabled.
+
+This passes `--strict-mcp-config' together with an empty
+`--mcp-config' to Claude, which causes it to ignore project and
+user MCP configurations.  The setting only takes effect when Claude
+is next started; running sessions are unaffected."
+  :type 'boolean
+  :group 'claude-code)
+
+(defcustom claude-code-mcp-proxy-host "127.0.0.1"
+  "Host of the local MCP proxy control plane."
+  :type 'string
+  :group 'claude-code)
+
+(defcustom claude-code-mcp-proxy-port 8765
+  "Port of the local MCP proxy control plane."
+  :type 'integer
+  :group 'claude-code)
+
 (defcustom claude-code-sandbox-program nil
   "Program to run when starting Claude in sandbox mode.
 This must be set to the path of your Claude sandbox binary before use."
@@ -1382,9 +1402,11 @@ With double prefix ARG (\\[universal-argument] \\[universal-argument]), prompt f
          ;; Prompt for instance name (only if instances exist, or force-prompt is true)
          (instance-name (claude-code--prompt-for-instance-name dir existing-instance-names force-prompt))
          (buffer-name (claude-code--buffer-name instance-name))
-         (program-switches (if extra-switches
-                               (append claude-code-program-switches extra-switches)
-                             claude-code-program-switches))
+         (program-switches (append claude-code-program-switches
+                                  (when claude-code-disable-mcp
+                                    '("--mcp-config" "{\"mcpServers\":{}}"
+                                      "--strict-mcp-config"))
+                                  extra-switches))
 
          ;; Set process-adaptive-read-buffering to nil to avoid flickering while Claude is processing
          (process-adaptive-read-buffering nil)
@@ -2159,6 +2181,164 @@ The image is saved to a temporary file and sent to Claude using the @ syntax."
 
 (define-key claude-code-command-map (kbd "V") 'claude-code-paste-image)
 
+(defun claude-code-toggle-disable-mcp ()
+  "Toggle whether new Claude sessions start with all MCP servers disabled.
+
+Flips `claude-code-disable-mcp'.  The change applies the next time
+Claude is started; existing sessions are not affected."
+  (interactive)
+  (setq claude-code-disable-mcp (not claude-code-disable-mcp))
+  (message "MCP access for new Claude sessions: %s (restart Claude to apply)"
+           (if claude-code-disable-mcp "DISABLED" "enabled")))
+
+;;;; MCP proxy control plane client
+
+(require 'json)
+(require 'url)
+
+(defun claude-code--mcp-proxy-url (path)
+  "Return the proxy control-plane URL for PATH."
+  (format "http://%s:%d%s"
+          claude-code-mcp-proxy-host
+          claude-code-mcp-proxy-port
+          path))
+
+(defun claude-code--mcp-proxy-request (method path &optional body)
+  "Send a METHOD request to PATH on the local MCP proxy.
+
+BODY, if non-nil, is a Lisp object that will be JSON-encoded as the
+request body.  Returns the parsed JSON response as an alist (with
+JSON booleans mapped to t/nil).  Signals an error on transport
+failure or non-2xx status."
+  (let* ((url (claude-code--mcp-proxy-url path))
+         (url-request-method method)
+         (url-request-extra-headers
+          (when body '(("Content-Type" . "application/json"))))
+         (url-request-data
+          (when body
+            (encode-coding-string (json-encode body) 'utf-8)))
+         (buf (url-retrieve-synchronously url t t 5)))
+    (unless buf
+      (error "MCP proxy: no response from %s (is the proxy running?)" url))
+    (unwind-protect
+        (with-current-buffer buf
+          (goto-char (point-min))
+          (unless (re-search-forward "^HTTP/[0-9.]+ \\([0-9]+\\)" nil t)
+            (error "MCP proxy: malformed response from %s" url))
+          (let ((status (string-to-number (match-string 1))))
+            (unless (re-search-forward "\n\n" nil t)
+              (error "MCP proxy: missing response body"))
+            (let* ((body-str (buffer-substring (point) (point-max)))
+                   (json-object-type 'alist)
+                   (json-array-type 'list)
+                   (json-false nil)
+                   (json-null nil)
+                   (parsed (if (string-empty-p (string-trim body-str))
+                               nil
+                             (json-read-from-string body-str))))
+              (unless (and (>= status 200) (< status 300))
+                (error "MCP proxy: HTTP %d: %s" status
+                       (or (alist-get 'error parsed) body-str)))
+              parsed)))
+      (kill-buffer buf))))
+
+(defun claude-code--mcp-proxy-bool (v)
+  "Encode Lisp V as a JSON boolean for `json-encode'."
+  (if v t :json-false))
+
+(defun claude-code-mcp-proxy-status ()
+  "Show current state of the local MCP proxy in the echo area."
+  (interactive)
+  (let* ((status (claude-code--mcp-proxy-request "GET" "/status"))
+         (enabled (alist-get 'enabled status))
+         (upstreams (alist-get 'upstreams status))
+         (parts (mapcar
+                 (lambda (entry)
+                   (let* ((name (symbol-name (car entry)))
+                          (info (cdr entry))
+                          (up-on (alist-get 'enabled info))
+                          (n (length (alist-get 'tools info))))
+                     (format "%s(%s,%dt)" name
+                             (if up-on "on" "off") n)))
+                 upstreams)))
+    (message "MCP proxy: %s; upstreams: %s"
+             (if enabled "ENABLED" "disabled")
+             (if parts (mapconcat #'identity parts ", ") "(none)"))))
+
+(defun claude-code-mcp-proxy-toggle ()
+  "Toggle the MCP proxy global enable flag without restarting Claude."
+  (interactive)
+  (let* ((status (claude-code--mcp-proxy-request "GET" "/status"))
+         (new (not (alist-get 'enabled status))))
+    (claude-code--mcp-proxy-request
+     "POST" "/enabled"
+     `((enabled . ,(claude-code--mcp-proxy-bool new))))
+    (message "MCP proxy: %s" (if new "ENABLED" "disabled"))))
+
+(defun claude-code--mcp-proxy-pick-upstream (prompt)
+  "Read an upstream name from the proxy status, prompting with PROMPT."
+  (let* ((status (claude-code--mcp-proxy-request "GET" "/status"))
+         (names (mapcar (lambda (e) (symbol-name (car e)))
+                        (alist-get 'upstreams status))))
+    (cond
+     ((null names) (error "MCP proxy has no upstreams configured"))
+     ((= (length names) 1) (car names))
+     (t (completing-read prompt names nil t)))))
+
+(defun claude-code--mcp-proxy-get-folders (upstream)
+  "Return the writable-folders list for UPSTREAM."
+  (alist-get
+   'folders
+   (claude-code--mcp-proxy-request
+    "GET" (format "/servers/%s/writable-folders" upstream))))
+
+(defun claude-code--mcp-proxy-put-folders (upstream folders)
+  "Replace the writable-folders list for UPSTREAM with FOLDERS."
+  (claude-code--mcp-proxy-request
+   "PUT" (format "/servers/%s/writable-folders" upstream)
+   `((folders . ,(vconcat folders)))))
+
+(defun claude-code-mcp-proxy-list-writable-folders ()
+  "Show the writable-folder allowlist for an upstream."
+  (interactive)
+  (let* ((name (claude-code--mcp-proxy-pick-upstream "Upstream: "))
+         (folders (claude-code--mcp-proxy-get-folders name)))
+    (message "%s writable folders: %s"
+             name
+             (if folders (mapconcat #'identity folders ", ") "(none)"))))
+
+(defun claude-code-mcp-proxy-add-writable-folder (folder)
+  "Add FOLDER to an upstream's writable-folder allowlist.
+
+FOLDER is a Google Drive folder ID (the opaque string from a folder URL).
+Prompts for the upstream when more than one is configured."
+  (interactive (list (read-string "Folder ID: ")))
+  (when (string-empty-p (string-trim folder))
+    (user-error "Folder ID is empty"))
+  (let* ((name (claude-code--mcp-proxy-pick-upstream "Upstream: "))
+         (current (claude-code--mcp-proxy-get-folders name))
+         (new (delete-dups (append current (list folder))))
+         (resp (claude-code--mcp-proxy-put-folders name new)))
+    (message "%s writable folders: %s"
+             name
+             (mapconcat #'identity (alist-get 'folders resp) ", "))))
+
+(defun claude-code-mcp-proxy-remove-writable-folder ()
+  "Remove a folder from an upstream's writable-folder allowlist."
+  (interactive)
+  (let* ((name (claude-code--mcp-proxy-pick-upstream "Upstream: "))
+         (current (claude-code--mcp-proxy-get-folders name)))
+    (unless current
+      (user-error "%s has no writable folders to remove" name))
+    (let* ((victim (completing-read "Remove folder: " current nil t))
+           (new (delete victim (copy-sequence current)))
+           (resp (claude-code--mcp-proxy-put-folders name new)))
+      (message "%s writable folders: %s"
+               name
+               (or (mapconcat #'identity (alist-get 'folders resp) ", ")
+                   "(none)")))))
+
+
 (easy-menu-define claude-code-menu global-map "Claude Code menu."
   '("Claude"
     ["Paste Image (C-c c V)" claude-code-paste-image
@@ -2169,7 +2349,24 @@ The image is saved to a temporary file and sent to Claude using the @ syntax."
      :help "Fix terminal display corruption after window resize"]
     "---"
     ("Switch Context"
-     :filter (lambda (_) (claude-code--contexts-menu-items)))))
+     :filter (lambda (_) (claude-code--contexts-menu-items)))
+    "---"
+    ["Disable MCP access (new sessions)" claude-code-toggle-disable-mcp
+     :style toggle
+     :selected claude-code-disable-mcp
+     :help "Toggle whether new Claude sessions start with all MCP servers disabled"]
+    ("MCP Proxy"
+     ["Toggle Proxy (no restart)" claude-code-mcp-proxy-toggle
+      :help "Enable/disable all proxied MCP access at runtime"]
+     ["Show Status" claude-code-mcp-proxy-status
+      :help "Show current proxy state and per-upstream tool counts"]
+     "---"
+     ["List Writable Folders" claude-code-mcp-proxy-list-writable-folders
+      :help "Show the writable-folder allowlist for an upstream"]
+     ["Add Writable Folder..." claude-code-mcp-proxy-add-writable-folder
+      :help "Add a Google Drive folder ID to the writable allowlist"]
+     ["Remove Writable Folder..." claude-code-mcp-proxy-remove-writable-folder
+      :help "Remove a folder from the writable allowlist"])))
 
 ;;;; Mode definition
 ;;;###autoload
