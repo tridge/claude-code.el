@@ -49,9 +49,9 @@
   "When non-nil, make URLs in Claude's terminal output clickable.
 
 URLs in the visible portion of the buffer are highlighted using
-`goto-address' overlays so they can be followed with a mouse click
-\(mouse-1 or mouse-2) or with \\[goto-address-at-point], without
-needing to switch to read-only mode and copy the URL by hand.
+`goto-address' overlays so they can be followed with a left or middle
+mouse click, or with \\[goto-address-at-point], without needing to
+switch to read-only mode and copy the URL by hand.
 
 This works with both the eat and vterm terminal backends."
   :type 'boolean
