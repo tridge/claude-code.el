@@ -1403,6 +1403,7 @@ With double prefix ARG (\\[universal-argument] \\[universal-argument]), prompt f
          (instance-name (claude-code--prompt-for-instance-name dir existing-instance-names force-prompt))
          (buffer-name (claude-code--buffer-name instance-name))
          (program-switches (append claude-code-program-switches
+                                  '("--permission-mode" "auto")
                                   (when claude-code-disable-mcp
                                     '("--mcp-config" "{\"mcpServers\":{}}"
                                       "--strict-mcp-config"))
@@ -2040,17 +2041,51 @@ With two prefix ARGs, both add instructions and switch to Claude buffer."
   (interactive)
   (claude-code--term-send-string claude-code-terminal-backend (kbd "RET")))
 
+(defvar-local claude-code--permission-mode "default"
+  "Current permission mode for this Claude session.
+
+Tracks position in the Shift-Tab cycle: default, acceptEdits, plan, auto.")
+
+(defconst claude-code--permission-modes '("default" "acceptEdits" "plan" "auto")
+  "Ordered list of permission modes in Shift-Tab cycle order.")
+
 ;;;###autoload
 (defun claude-code-cycle-mode ()
   "Send Shift-Tab to Claude to cycle between modes.
 
 Claude uses Shift-Tab to cycle through:
-- Default mode
-- Auto-accept edits mode
-- Plan mode"
+- Default mode (ask permission for edits and commands)
+- Auto-accept edits mode (ask permission for commands only)
+- Plan mode (read-only exploration)
+- Auto mode (background classifier approves commands)"
   (interactive)
   (claude-code--with-buffer
-   (claude-code--term-send-string claude-code-terminal-backend "\e[Z")))
+   (claude-code--term-send-string claude-code-terminal-backend "\e[Z")
+   (let* ((modes claude-code--permission-modes)
+          (cur-idx (or (cl-position claude-code--permission-mode modes :test #'equal) 0))
+          (next-idx (mod (1+ cur-idx) (length modes))))
+     (setq claude-code--permission-mode (nth next-idx modes))
+     (message "Claude permission mode: %s" claude-code--permission-mode))))
+
+;;;###autoload
+(defun claude-code-toggle-auto-mode ()
+  "Toggle between auto mode and default permission mode.
+
+Auto mode uses a background classifier to approve or deny external tool
+actions instead of prompting the user for each one.  Requires a Team plan
+and Claude Sonnet 4.6 or Opus 4.6, and --enable-auto-mode at startup."
+  (interactive)
+  (claude-code--with-buffer
+   (let* ((modes claude-code--permission-modes)
+          (cur-idx (or (cl-position claude-code--permission-mode modes :test #'equal) 0))
+          (target (if (equal claude-code--permission-mode "auto") "default" "auto"))
+          (target-idx (cl-position target modes :test #'equal))
+          (n (length modes))
+          (steps (mod (- target-idx cur-idx) n)))
+     (dotimes (_ steps)
+       (claude-code--term-send-string claude-code-terminal-backend "\e[Z"))
+     (setq claude-code--permission-mode target)
+     (message "Claude permission mode: %s" target))))
 
 ;; (define-key key-translation-map (kbd "ESC") "")
 
@@ -2134,6 +2169,16 @@ terminal display becomes garbled after resizing the Emacs window."
   (claude-code--with-buffer
    (claude-code--term-refresh claude-code-terminal-backend)
    (message "Terminal refresh requested")))
+
+(defun claude-code-reload ()
+  "Reload claude-code.el from its source file."
+  (interactive)
+  (let ((source-file (locate-library "claude-code.el" nil nil t)))
+    (if source-file
+        (progn
+          (load-file source-file)
+          (message "Reloaded %s" source-file))
+      (error "Cannot find claude-code.el source file"))))
 
 ;;;; Menu bar definition
 (defun claude-code--menu-switch-to-buffer (buffer)
@@ -2338,6 +2383,19 @@ Prompts for the upstream when more than one is configured."
                (or (mapconcat #'identity (alist-get 'folders resp) ", ")
                    "(none)")))))
 
+(defun claude-code--insert-effort-keyword (keyword)
+  "Insert thinking effort KEYWORD into Claude's prompt without sending.
+
+Claude Code recognizes the magic words \"think\", \"think hard\",
+\"think harder\", and \"ultrathink\" in user messages to control the
+model's reasoning budget.  This inserts the keyword followed by a
+space so the user can append their prompt."
+  (if-let ((claude-code-buffer (claude-code--get-or-prompt-for-buffer)))
+      (with-current-buffer claude-code-buffer
+        (claude-code--term-send-string
+         claude-code-terminal-backend (concat keyword " "))
+        (display-buffer claude-code-buffer))
+    (claude-code--show-not-running-message)))
 
 (easy-menu-define claude-code-menu global-map "Claude Code menu."
   '("Claude"
@@ -2348,6 +2406,32 @@ Prompts for the upstream when more than one is configured."
     ["Refresh Terminal (C-c c l)" claude-code-refresh-terminal
      :help "Fix terminal display corruption after window resize"]
     "---"
+    ("Permission Mode"
+     ["Toggle Auto Mode" claude-code-toggle-auto-mode
+      :help "Switch between prompted permissions and auto classifier"]
+     ["Cycle Mode (Shift-Tab)" claude-code-cycle-mode
+      :help "Cycle: default -> acceptEdits -> plan -> auto"]
+     "---"
+     ["View Permissions" (lambda () (interactive)
+                           (claude-code--do-send-command "/permissions"))
+      :help "Show current permission settings"])
+    ("Effort Level"
+     ["think" (lambda () (interactive)
+                (claude-code--insert-effort-keyword "think"))
+      :help "Insert \"think\" to request basic extended thinking"]
+     ["think hard" (lambda () (interactive)
+                     (claude-code--insert-effort-keyword "think hard"))
+      :help "Insert \"think hard\" for a larger thinking budget"]
+     ["think harder" (lambda () (interactive)
+                       (claude-code--insert-effort-keyword "think harder"))
+      :help "Insert \"think harder\" for an even larger thinking budget"]
+     ["ultrathink" (lambda () (interactive)
+                     (claude-code--insert-effort-keyword "ultrathink"))
+      :help "Insert \"ultrathink\" for maximum thinking budget"]
+     "---"
+     ["Choose Model (/model)" (lambda () (interactive)
+                                (claude-code--do-send-command "/model"))
+      :help "Open Claude's /model picker to switch model/effort"])
     ("Switch Context"
      :filter (lambda (_) (claude-code--contexts-menu-items)))
     "---"
@@ -2366,7 +2450,10 @@ Prompts for the upstream when more than one is configured."
      ["Add Writable Folder..." claude-code-mcp-proxy-add-writable-folder
       :help "Add a Google Drive folder ID to the writable allowlist"]
      ["Remove Writable Folder..." claude-code-mcp-proxy-remove-writable-folder
-      :help "Remove a folder from the writable allowlist"])))
+      :help "Remove a folder from the writable allowlist"])
+    "---"
+    ["Reload claude-code.el" claude-code-reload
+     :help "Reload claude-code.el from source"]))
 
 ;;;; Mode definition
 ;;;###autoload
