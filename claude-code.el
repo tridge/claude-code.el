@@ -1173,6 +1173,17 @@ it's remembered for the current directory."
           (puthash current-dir selected-buffer claude-code--directory-buffer-map))
         selected-buffer))))
 
+(defun claude-code--find-visible-claude-buffers ()
+  "Find Claude buffers that are visible in any window on any frame."
+  (let (visible)
+    (walk-windows
+     (lambda (win)
+       (let ((buf (window-buffer win)))
+         (when (claude-code--buffer-p buf)
+           (cl-pushnew buf visible :test #'eq))))
+     nil t)
+    visible))
+
 (defun claude-code--get-or-prompt-for-buffer ()
   "Get Claude buffer for current directory or prompt for selection.
 
@@ -1182,9 +1193,10 @@ transient menu) act on that instance without prompting.
 
 Otherwise, first checks for Claude buffers in the current directory.  If
 there are multiple, prompts the user to select one.  If there are none,
-checks if there's a remembered selection for this directory.  If not, and
-there are other Claude buffers running, prompts the user to select one.
-Returns the buffer or nil."
+checks if there's a remembered selection for this directory.  Then
+checks for a visible Claude buffer.  Finally, if there are other Claude
+buffers running, prompts the user to select one.  Returns the buffer or
+nil."
   (if (claude-code--buffer-p (current-buffer))
       ;; Invoked from inside a Claude instance - act on that instance, no prompt.
       (current-buffer)
@@ -1201,16 +1213,20 @@ Returns the buffer or nil."
        ;; Single buffer for this directory - use it
        ((= (length dir-buffers) 1)
         (car dir-buffers))
-       ;; No buffers for this directory - check remembered or prompt for other directories
+       ;; No buffers for this directory - check remembered, visible, or prompt
        (t
         ;; Check for remembered selection for this directory
         (let ((remembered-buffer (gethash current-dir claude-code--directory-buffer-map)))
           (if (and remembered-buffer (buffer-live-p remembered-buffer))
               remembered-buffer
-            ;; No valid remembered buffer, check for other Claude instances
-            (let ((other-buffers (claude-code--find-all-claude-buffers)))
-              (when other-buffers
-                (claude-code--prompt-for-claude-buffer))))))))))
+            ;; Check for a single visible Claude buffer
+            (let ((visible-buffers (claude-code--find-visible-claude-buffers)))
+              (if (= (length visible-buffers) 1)
+                  (car visible-buffers)
+                ;; No single visible buffer, check for other Claude instances
+                (let ((other-buffers (claude-code--find-all-claude-buffers)))
+                  (when other-buffers
+                    (claude-code--prompt-for-claude-buffer))))))))))))
 
 (defun claude-code--switch-to-selected-buffer (selected-buffer)
   "Switch to SELECTED-BUFFER if it's not the current buffer.
