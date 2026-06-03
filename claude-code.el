@@ -1176,34 +1176,41 @@ it's remembered for the current directory."
 (defun claude-code--get-or-prompt-for-buffer ()
   "Get Claude buffer for current directory or prompt for selection.
 
-First checks for Claude buffers in the current directory. If there are
-multiple, prompts the user to select one. If there are none, checks if
-there's a remembered selection for this directory. If not, and there are
-other Claude buffers running, prompts the user to select one. Returns
-the buffer or nil."
-  (let* ((current-dir (claude-code--directory))
-         (dir-buffers (claude-code--find-claude-buffers-for-directory current-dir)))
-    (cond
-     ;; Multiple buffers for this directory - prompt for selection
-     ((> (length dir-buffers) 1)
-      (claude-code--select-buffer-from-choices
-       (format "Select Claude instance for %s: "
-               (abbreviate-file-name current-dir))
-       dir-buffers
-       t))  ; Use simple format (just instance names)
-     ;; Single buffer for this directory - use it
-     ((= (length dir-buffers) 1)
-      (car dir-buffers))
-     ;; No buffers for this directory - check remembered or prompt for other directories
-     (t
-      ;; Check for remembered selection for this directory
-      (let ((remembered-buffer (gethash current-dir claude-code--directory-buffer-map)))
-        (if (and remembered-buffer (buffer-live-p remembered-buffer))
-            remembered-buffer
-          ;; No valid remembered buffer, check for other Claude instances
-          (let ((other-buffers (claude-code--find-all-claude-buffers)))
-            (when other-buffers
-              (claude-code--prompt-for-claude-buffer)))))))))
+If the current buffer is itself a Claude buffer, return it directly so
+that commands invoked from within an instance (via a keybinding or the
+transient menu) act on that instance without prompting.
+
+Otherwise, first checks for Claude buffers in the current directory.  If
+there are multiple, prompts the user to select one.  If there are none,
+checks if there's a remembered selection for this directory.  If not, and
+there are other Claude buffers running, prompts the user to select one.
+Returns the buffer or nil."
+  (if (claude-code--buffer-p (current-buffer))
+      ;; Invoked from inside a Claude instance - act on that instance, no prompt.
+      (current-buffer)
+    (let* ((current-dir (claude-code--directory))
+           (dir-buffers (claude-code--find-claude-buffers-for-directory current-dir)))
+      (cond
+       ;; Multiple buffers for this directory - prompt for selection
+       ((> (length dir-buffers) 1)
+        (claude-code--select-buffer-from-choices
+         (format "Select Claude instance for %s: "
+                 (abbreviate-file-name current-dir))
+         dir-buffers
+         t))  ; Use simple format (just instance names)
+       ;; Single buffer for this directory - use it
+       ((= (length dir-buffers) 1)
+        (car dir-buffers))
+       ;; No buffers for this directory - check remembered or prompt for other directories
+       (t
+        ;; Check for remembered selection for this directory
+        (let ((remembered-buffer (gethash current-dir claude-code--directory-buffer-map)))
+          (if (and remembered-buffer (buffer-live-p remembered-buffer))
+              remembered-buffer
+            ;; No valid remembered buffer, check for other Claude instances
+            (let ((other-buffers (claude-code--find-all-claude-buffers)))
+              (when other-buffers
+                (claude-code--prompt-for-claude-buffer))))))))))
 
 (defun claude-code--switch-to-selected-buffer (selected-buffer)
   "Switch to SELECTED-BUFFER if it's not the current buffer.
