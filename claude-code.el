@@ -1019,8 +1019,8 @@ sends SIGWINCH and Ctrl-L to make Claude redraw."
 (defvar goto-address-url-face)
 (defvar goto-address-url-mouse-face)
 
-(defvar-local claude-code--link-fontify-timer nil
-  "Idle timer that fontifies URLs in this Claude buffer.")
+(defvar claude-code--link-fontify-timer nil
+  "Global idle timer that fontifies links in all Claude buffers.")
 
 (defvar-local claude-code--link-fontify-state nil
   "Last seen content/scroll state, used to skip redundant fontification.
@@ -1127,29 +1127,30 @@ that repeated idle firings are cheap."
           (setq claude-code--link-fontify-state state)
           (claude-code--fontify-visible-links))))))
 
-(defun claude-code--cancel-link-fontify-timer ()
-  "Cancel the link fontification idle timer for the current buffer."
-  (when claude-code--link-fontify-timer
-    (cancel-timer claude-code--link-fontify-timer)
-    (setq claude-code--link-fontify-timer nil)))
+(defun claude-code--fontify-all-buffers ()
+  "Fontify links in every live Claude buffer.
 
-(defun claude-code--setup-clickable-links ()
-  "Make URLs and #NNN references in the current Claude buffer clickable.
-
-Starts a buffer-local idle timer that highlights links in the visible
-portion of the buffer as Claude produces output, and arranges for the
-timer to be cancelled when the buffer is killed.  Does nothing unless at
-least one of `claude-code-make-links-clickable' or
-`claude-code-linkify-issue-references' is non-nil."
+Run from the global idle timer.  Each buffer is skipped cheaply when its
+content and scroll position are unchanged, so the cost scales with the
+buffers that actually produced output."
   (when (or claude-code-make-links-clickable
             claude-code-linkify-issue-references)
     (require 'goto-addr)
-    (claude-code--cancel-link-fontify-timer)
-    (setq claude-code--link-fontify-timer
-          (run-with-idle-timer claude-code-link-fontify-idle-delay t
-                               #'claude-code--maybe-fontify-links
-                               (current-buffer)))
-    (add-hook 'kill-buffer-hook #'claude-code--cancel-link-fontify-timer nil t)))
+    (dolist (buffer (claude-code--find-all-claude-buffers))
+      (claude-code--maybe-fontify-links buffer))))
+
+(defun claude-code--ensure-link-fontify-timer ()
+  "Start, or restart, the global link-fontification idle timer.
+
+Called at load time so that reloading the library re-arms the timer and
+picks up already-running Claude buffers without having to restart them."
+  (when (timerp claude-code--link-fontify-timer)
+    (cancel-timer claude-code--link-fontify-timer))
+  (setq claude-code--link-fontify-timer
+        (run-with-idle-timer claude-code-link-fontify-idle-delay t
+                             #'claude-code--fontify-all-buffers)))
+
+(claude-code--ensure-link-fontify-timer)
 
 ;;;; Private util functions
 (defmacro claude-code--with-buffer (&rest body)
@@ -1550,9 +1551,6 @@ With double prefix ARG (\\[universal-argument] \\[universal-argument]), prompt f
 
       ;; Add cleanup hook to remove directory mappings when buffer is killed
       (add-hook 'kill-buffer-hook #'claude-code--cleanup-directory-mapping nil t)
-
-      ;; Make URLs in Claude's output clickable
-      (claude-code--setup-clickable-links)
 
       ;; run start hooks
       (run-hooks 'claude-code-start-hook)
