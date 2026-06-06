@@ -68,6 +68,21 @@ Only used when `claude-code-make-links-clickable' is non-nil."
   :type 'number
   :group 'claude-code)
 
+(defcustom claude-code-linkify-issue-references t
+  "When non-nil, make bare #NNN issue/PR references clickable.
+
+Claude often prints GitHub issue and pull-request references as plain
+text like #970 rather than full URLs.  When this is enabled, such
+references are highlighted and clicking one opens
+https://github.com/OWNER/REPO/pull/NNN in a browser, where OWNER/REPO
+is resolved from the Claude buffer's `origin' git remote.
+
+This only takes effect for buffers whose directory has a github.com
+`origin' remote; elsewhere #NNN references are left as plain text.
+\(GitHub redirects /pull/NNN to /issues/NNN when NNN is an issue.)"
+  :type 'boolean
+  :group 'claude-code)
+
 (defcustom claude-code-start-hook nil
   "Hook run after Claude is started."
   :type 'hook
@@ -1001,6 +1016,8 @@ sends SIGWINCH and Ctrl-L to make Claude redraw."
 ;;;; Clickable links
 
 (declare-function goto-address-fontify "goto-addr" (&optional start end))
+(defvar goto-address-url-face)
+(defvar goto-address-url-mouse-face)
 
 (defvar-local claude-code--link-fontify-timer nil
   "Idle timer that fontifies URLs in this Claude buffer.")
@@ -1011,19 +1028,89 @@ sends SIGWINCH and Ctrl-L to make Claude redraw."
 A cons of the buffer's `buffer-chars-modified-tick' and the list of
 window start positions when links were last fontified.")
 
+(defvar-local claude-code--github-repo 'unset
+  "Cached \"OWNER/REPO\" for this buffer's github.com `origin' remote.
+
+The symbol `unset' means it has not been resolved yet; nil means there
+is no usable github.com remote for this buffer.")
+
+(defun claude-code--resolve-github-repo (dir)
+  "Return \"OWNER/REPO\" for the github.com `origin' remote in DIR, else nil."
+  (when (and dir (file-directory-p dir) (not (file-remote-p dir)))
+    (let* ((default-directory dir)
+           (url (ignore-errors
+                  (car (process-lines "git" "remote" "get-url" "origin")))))
+      (when (and url
+                 (string-match
+                  "github\\.com[/:]\\([^/]+\\)/\\(.+?\\)\\(?:\\.git\\)?/?\\'"
+                  url))
+        (concat (match-string 1 url) "/" (match-string 2 url))))))
+
+(defun claude-code--github-repo ()
+  "Return cached \"OWNER/REPO\" for this buffer, resolving it on first use."
+  (when (eq claude-code--github-repo 'unset)
+    (setq claude-code--github-repo
+          (claude-code--resolve-github-repo default-directory)))
+  claude-code--github-repo)
+
+(defun claude-code--browse-issue-link (&optional event)
+  "Open the GitHub issue or pull-request reference at point or EVENT."
+  (interactive (list last-input-event))
+  (let* ((pos (if (mouse-event-p event)
+                  (posn-point (event-end event))
+                (point)))
+         (url (and pos (get-char-property pos 'claude-code-issue-url))))
+    (if url
+        (browse-url url)
+      (user-error "No GitHub reference at point"))))
+
+(defvar claude-code--issue-link-keymap
+  (let ((map (make-sparse-keymap)))
+    (define-key map [mouse-2] #'claude-code--browse-issue-link)
+    (define-key map (kbd "C-c RET") #'claude-code--browse-issue-link)
+    map)
+  "Keymap on #NNN issue/PR overlays in Claude buffers.")
+
+(defun claude-code--fontify-issue-links (start end)
+  "Make #NNN issue/PR references between START and END clickable.
+
+Does nothing unless the buffer has a resolvable github.com remote."
+  (when-let ((repo (claude-code--github-repo)))
+    ;; Clean up overlays from a previous pass over this region.
+    (dolist (ov (overlays-in start end))
+      (when (overlay-get ov 'claude-code-issue-link)
+        (delete-overlay ov)))
+    (save-excursion
+      (goto-char start)
+      (while (re-search-forward "#\\([0-9]+\\)\\>" end t)
+        (let ((ov (make-overlay (match-beginning 0) (match-end 0))))
+          (overlay-put ov 'claude-code-issue-link t)
+          (overlay-put ov 'claude-code-issue-url
+                       (format "https://github.com/%s/pull/%s"
+                               repo (match-string 1)))
+          (overlay-put ov 'face goto-address-url-face)
+          (overlay-put ov 'mouse-face goto-address-url-mouse-face)
+          (overlay-put ov 'follow-link t)
+          (overlay-put ov 'help-echo "mouse-2, C-c RET: open on GitHub")
+          (overlay-put ov 'keymap claude-code--issue-link-keymap)
+          (overlay-put ov 'evaporate t))))))
+
 (defun claude-code--fontify-visible-links ()
-  "Make URLs clickable in the visible portion of the current Claude buffer.
+  "Make URLs and #NNN references clickable in the current Claude buffer.
 
 Fontifies the visible region of every window currently displaying the
-buffer, so only on-screen text is scanned.  Uses `goto-address'
-overlays, which work whether the buffer is in interactive or read-only
-mode."
+buffer, so only on-screen text is scanned.  URLs use `goto-address'
+overlays and #NNN issue/PR references use our own overlays; both work
+whether the buffer is in interactive or read-only mode."
   (require 'goto-addr)
   (dolist (window (get-buffer-window-list (current-buffer) nil t))
     (let ((start (window-start window))
           (end (window-end window t)))
       (when (and start end (< start end))
-        (goto-address-fontify start end)))))
+        (when claude-code-make-links-clickable
+          (goto-address-fontify start end))
+        (when claude-code-linkify-issue-references
+          (claude-code--fontify-issue-links start end))))))
 
 (defun claude-code--maybe-fontify-links (buffer)
   "Fontify links in BUFFER when its content or scroll position has changed.
@@ -1047,13 +1134,15 @@ that repeated idle firings are cheap."
     (setq claude-code--link-fontify-timer nil)))
 
 (defun claude-code--setup-clickable-links ()
-  "Make URLs in the current Claude buffer clickable.
+  "Make URLs and #NNN references in the current Claude buffer clickable.
 
-Starts a buffer-local idle timer that highlights URLs in the visible
+Starts a buffer-local idle timer that highlights links in the visible
 portion of the buffer as Claude produces output, and arranges for the
-timer to be cancelled when the buffer is killed.  Does nothing when
-`claude-code-make-links-clickable' is nil."
-  (when claude-code-make-links-clickable
+timer to be cancelled when the buffer is killed.  Does nothing unless at
+least one of `claude-code-make-links-clickable' or
+`claude-code-linkify-issue-references' is non-nil."
+  (when (or claude-code-make-links-clickable
+            claude-code-linkify-issue-references)
     (require 'goto-addr)
     (claude-code--cancel-link-fontify-timer)
     (setq claude-code--link-fontify-timer
