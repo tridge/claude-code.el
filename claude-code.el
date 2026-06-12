@@ -1252,6 +1252,12 @@ is collapsed and trimmed.  Returns nil if nothing usable remains."
   (when (and (stringp title) (not (string-empty-p title)))
     (let ((s title))
       (setq s (replace-regexp-in-string "[[:cntrl:]]" "" s))
+      ;; Claude prefixes the title with an animated status glyph and a
+      ;; space (a braille spinner frame while working, or a ready marker
+      ;; like ✳).  Drop a leading run of symbol characters followed by
+      ;; whitespace so the buffer name is just the session name and does
+      ;; not churn as the spinner animates.
+      (setq s (replace-regexp-in-string "\\`[^[:alnum:][:space:]]+[[:space:]]+" "" s))
       (setq s (replace-regexp-in-string "[:*]" "" s))
       (setq s (replace-regexp-in-string "[ \t\n\r]+" " " s))
       (setq s (string-trim s))
@@ -1866,6 +1872,27 @@ the vterm buffer current.  The advice is global, so only act on Claude
 buffers."
   (when (claude-code--buffer-p (current-buffer))
     (claude-code--rename-from-title title)))
+
+(defun claude-code--install-title-hooks ()
+  "Install the terminal-title hooks for current and future Claude buffers.
+
+Called at load time so that reloading the library starts following the
+title in already-running sessions, not only in buffers created afterward.
+The vterm advice is global (covers every vterm Claude buffer); for eat,
+the per-terminal `set-title-function' is set on each existing eat buffer
+\(new eat buffers get it from `claude-code--term-configure')."
+  ;; vterm: one global, idempotent advice covers all vterm Claude buffers.
+  (with-eval-after-load 'vterm
+    (advice-add 'vterm--set-title :after #'claude-code--vterm-title-handler))
+  ;; eat: set the per-terminal parameter on already-running eat buffers.
+  (dolist (buf (claude-code--find-all-claude-buffers))
+    (with-current-buffer buf
+      (when (bound-and-true-p eat-terminal)
+        (ignore-errors
+          (eval '(setf (eat-term-parameter eat-terminal 'set-title-function)
+                       #'claude-code--eat-title-handler)))))))
+
+(claude-code--install-title-hooks)
 
 (defun claude-code--vterm-bell-detector (orig-fun process input)
   "Detect bell characters in vterm output and trigger notifications.
