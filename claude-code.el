@@ -122,6 +122,20 @@ is displayed before Claude is fully initialized."
   :type 'number
   :group 'claude-code)
 
+(defcustom claude-code-track-session-title t
+  "When non-nil, rename the session buffer to follow the terminal title.
+
+The Claude CLI sets the terminal title (for example when you run
+`/rename' in the Claude TUI).  When this is enabled, the Claude buffer
+is renamed to reflect that title, keeping the `*claude:DIR:' prefix and
+replacing only the instance-name component, so the new name shows in the
+mode line and the \"Switch Context\" menu.
+
+Disable this if Claude updates the title during normal activity and the
+resulting buffer renames are distracting."
+  :type 'boolean
+  :group 'claude-code)
+
 (defcustom claude-code-large-buffer-threshold 100000
   "Size threshold in characters above which buffers are considered \"large\".
 
@@ -698,9 +712,10 @@ _BACKEND is the terminal backend type (should be \\='eat)."
   ;; Set up custom scroll function to stop eat from scrolling to the top
   (setq-local eat--synchronize-scroll-function #'claude-code--eat-synchronize-scroll)
 
-  ;; Configure bell handler - ensure eat-terminal exists
+  ;; Configure bell and title handlers - ensure eat-terminal exists
   (when (bound-and-true-p eat-terminal)
-    (eval '(setf (eat-term-parameter eat-terminal 'ring-bell-function) #'claude-code--notify)))
+    (eval '(setf (eat-term-parameter eat-terminal 'ring-bell-function) #'claude-code--notify))
+    (eval '(setf (eat-term-parameter eat-terminal 'set-title-function) #'claude-code--eat-title-handler)))
 
   ;; fix wonky initial terminal layout that happens sometimes if we show the buffer before claude is ready
   (sleep-for claude-code-startup-delay))
@@ -913,6 +928,9 @@ _BACKEND is the terminal backend type (should be \\='vterm)."
   (advice-add 'vterm--filter :around #'claude-code--vterm-bell-detector)
   ;; Set up multi-line buffering to prevent flickering
   (advice-add 'vterm--filter :around #'claude-code--vterm-multiline-buffer-filter)
+  ;; Follow terminal title changes (e.g. /rename) to rename the buffer.
+  ;; Global, idempotent advice; self-guards on Claude buffers.
+  (advice-add 'vterm--set-title :after #'claude-code--vterm-title-handler)
   ;; Set up hook to restore keymap when exiting vterm-copy-mode
   (add-hook 'vterm-copy-mode-hook
             (lambda ()
@@ -1223,6 +1241,59 @@ For example, *claude:/path/to/project/:tests* returns \"tests\".
 For example, *claude:/path/to/project/* returns nil."
   (when (string-match "^\\*claude:\\([^:]+\\)\\(?::\\([^*]+\\)\\)?\\*$" buffer-name)
     (match-string 2 buffer-name)))
+
+(defun claude-code--sanitize-session-title (title)
+  "Turn terminal TITLE into a clean Claude instance name, or nil.
+
+Removes characters that would break the `*claude:DIR:INSTANCE*' buffer
+name format: control characters, `:' (which marks the directory/instance
+boundary) and `*' (which would break the trailing anchor).  Whitespace
+is collapsed and trimmed.  Returns nil if nothing usable remains."
+  (when (and (stringp title) (not (string-empty-p title)))
+    (let ((s title))
+      (setq s (replace-regexp-in-string "[[:cntrl:]]" "" s))
+      (setq s (replace-regexp-in-string "[:*]" "" s))
+      (setq s (replace-regexp-in-string "[ \t\n\r]+" " " s))
+      (setq s (string-trim s))
+      (unless (string-empty-p s) s))))
+
+(defun claude-code--unique-instance-buffer-name (dir name)
+  "Return a unique buffer name of the form `*claude:DIR:NAME*'.
+
+If that name is taken by a different live buffer, suffix NAME with
+`-2', `-3', and so on until the result is free.  The current buffer is
+treated as free, so renaming a buffer to the name it already holds does
+not bump the suffix."
+  (cl-flet ((freep (candidate)
+              (let ((b (get-buffer candidate)))
+                (or (null b) (eq b (current-buffer))))))
+    (let ((base (format "*claude:%s:%s*" dir name)))
+      (if (freep base)
+          base
+        (let ((n 2) candidate)
+          (while (not (freep (setq candidate
+                                   (format "*claude:%s:%s-%d*" dir name n))))
+            (setq n (1+ n)))
+          candidate)))))
+
+(defun claude-code--rename-from-title (title)
+  "Rename the current Claude buffer to follow terminal TITLE.
+
+Keeps the `*claude:DIR:' prefix from the current buffer name, replacing
+only the instance component with a sanitized form of TITLE, and ensures
+the result is unique.  Does nothing unless `claude-code-track-session-title'
+is enabled and the current buffer is a Claude buffer.  Any error is
+swallowed so this can run safely from a terminal output filter."
+  (when (and claude-code-track-session-title
+             (claude-code--buffer-p (current-buffer)))
+    (condition-case nil
+        (when-let* ((name (claude-code--sanitize-session-title title))
+                    (dir (claude-code--extract-directory-from-buffer-name
+                          (buffer-name)))
+                    (target (claude-code--unique-instance-buffer-name dir name)))
+          (unless (equal target (buffer-name))
+            (rename-buffer target)))
+      (error nil))))
 
 (defun claude-code--buffer-display-name (buffer)
   "Create a display name for Claude BUFFER.
@@ -1779,6 +1850,22 @@ TERMINAL is the eat terminal parameter (not used)."
     (funcall claude-code-notification-function
              "Claude Ready"
              "Waiting for your response")))
+
+(defun claude-code--eat-title-handler (_terminal title)
+  "Rename the current Claude buffer to follow eat terminal TITLE.
+
+Registered as the eat `set-title-function' parameter; eat calls it with
+the eat buffer current.  _TERMINAL is ignored."
+  (claude-code--rename-from-title title))
+
+(defun claude-code--vterm-title-handler (title)
+  "Rename the current Claude buffer to follow vterm terminal TITLE.
+
+Added as `:after' advice on `vterm--set-title', which vterm calls with
+the vterm buffer current.  The advice is global, so only act on Claude
+buffers."
+  (when (claude-code--buffer-p (current-buffer))
+    (claude-code--rename-from-title title)))
 
 (defun claude-code--vterm-bell-detector (orig-fun process input)
   "Detect bell characters in vterm output and trigger notifications.
