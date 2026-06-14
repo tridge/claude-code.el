@@ -136,6 +136,32 @@ resulting buffer renames are distracting."
   :type 'boolean
   :group 'claude-code)
 
+(defcustom claude-code-set-frame-title t
+  "When non-nil, override `frame-title-format' for Claude frames.
+
+The default Emacs frame title is the buffer name, which for Claude
+buffers is `*claude:LONG/DIRECTORY:NAME*'.  In a window switcher or
+taskbar that truncates titles, the directory pushes the session NAME off
+the end, so renamed sessions become hard to tell apart.
+
+With this enabled, Claude frames show the session name first (see
+`claude-code-frame-title-function'), so the chosen name survives
+truncation.  Non-Claude frames keep their original title.  Changing this
+at runtime takes effect on the next call to
+`claude-code--install-frame-title' (or when the library is reloaded)."
+  :type 'boolean
+  :group 'claude-code)
+
+(defcustom claude-code-frame-title-function #'claude-code--default-frame-title
+  "Function that builds the frame title for a Claude buffer.
+
+Called with two arguments, the instance name (a string, \"default\" when
+the buffer has no explicit instance) and the session directory (a
+string, or nil), and must return the title string.  Only used when
+`claude-code-set-frame-title' is non-nil."
+  :type 'function
+  :group 'claude-code)
+
 (defcustom claude-code-large-buffer-threshold 100000
   "Size threshold in characters above which buffers are considered \"large\".
 
@@ -1893,6 +1919,57 @@ the per-terminal `set-title-function' is set on each existing eat buffer
                        #'claude-code--eat-title-handler)))))))
 
 (claude-code--install-title-hooks)
+
+(defun claude-code--default-frame-title (instance directory)
+  "Build the default Claude frame title from INSTANCE and DIRECTORY.
+
+Returns \"INSTANCE (PROJECT)\" where PROJECT is the last component of
+DIRECTORY, or just INSTANCE when DIRECTORY is unavailable.  Putting the
+instance name first keeps it visible when window switchers truncate."
+  (let ((project (and directory
+                      (file-name-nondirectory (directory-file-name directory)))))
+    (if (and project (not (string-empty-p project)))
+        (format "%s (%s)" instance project)
+      instance)))
+
+(defvar claude-code--saved-frame-title-format 'unset
+  "Value of `frame-title-format' saved before claude-code overrode it.
+The symbol `unset' means claude-code has not overridden it yet.")
+
+(defun claude-code--frame-title ()
+  "Compute the frame title, putting the Claude session name first.
+
+For Claude buffers, defers to `claude-code-frame-title-function'.  For
+other buffers, reproduces the frame title that was in effect before
+claude-code overrode `frame-title-format'."
+  (let ((name (buffer-name)))
+    (if (claude-code--buffer-p name)
+        (funcall claude-code-frame-title-function
+                 (or (claude-code--extract-instance-name-from-buffer-name name)
+                     "default")
+                 (claude-code--extract-directory-from-buffer-name name))
+      (if (eq claude-code--saved-frame-title-format 'unset)
+          (buffer-name)
+        (format-mode-line claude-code--saved-frame-title-format)))))
+
+(defun claude-code--install-frame-title ()
+  "Install or remove the Claude frame-title override per the option.
+
+When `claude-code-set-frame-title' is non-nil, override
+`frame-title-format' (saving the previous value once) so Claude frames
+show the session name first.  When nil, restore the saved value.  Called
+at load time so reloading the library updates already-open frames."
+  (if claude-code-set-frame-title
+      (unless (equal frame-title-format '(:eval (claude-code--frame-title)))
+        (setq claude-code--saved-frame-title-format frame-title-format)
+        (setq frame-title-format '(:eval (claude-code--frame-title)))
+        (force-mode-line-update t))
+    (when (and (equal frame-title-format '(:eval (claude-code--frame-title)))
+               (not (eq claude-code--saved-frame-title-format 'unset)))
+      (setq frame-title-format claude-code--saved-frame-title-format)
+      (force-mode-line-update t))))
+
+(claude-code--install-frame-title)
 
 (defun claude-code--vterm-bell-detector (orig-fun process input)
   "Detect bell characters in vterm output and trigger notifications.
