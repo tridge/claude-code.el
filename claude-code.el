@@ -1923,14 +1923,16 @@ the per-terminal `set-title-function' is set on each existing eat buffer
 (defun claude-code--default-frame-title (instance directory)
   "Build the default Claude frame title from INSTANCE and DIRECTORY.
 
-Returns \"INSTANCE (PROJECT)\" where PROJECT is the last component of
-DIRECTORY, or just INSTANCE when DIRECTORY is unavailable.  Putting the
-instance name first keeps it visible when window switchers truncate."
+Returns \"*claude:INSTANCE (PROJECT)\" where PROJECT is the last
+component of DIRECTORY, or \"*claude:INSTANCE\" when DIRECTORY is
+unavailable.  The `*claude:' marker makes Claude frames easy to pick out
+in a window switcher, while the instance name stays near the front so it
+survives truncation."
   (let ((project (and directory
                       (file-name-nondirectory (directory-file-name directory)))))
     (if (and project (not (string-empty-p project)))
-        (format "%s (%s)" instance project)
-      instance)))
+        (format "*claude:%s (%s)" instance project)
+      (format "*claude:%s" instance))))
 
 (defvar claude-code--saved-frame-title-format 'unset
   "Value of `frame-title-format' saved before claude-code overrode it.
